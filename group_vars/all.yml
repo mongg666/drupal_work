@@ -1,0 +1,5 @@
+---
+# Настройки Drupal
+drupal_db_name: "drupaldb"
+drupal_db_user: "drupaluser"
+drupal_db_password: "DbPass123!"

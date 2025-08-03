@@ -1,0 +1,354 @@
+---
+- name: Deploy Drupal with PostgreSQL and Nginx
+  hosts: drupal
+  become: yes
+  become_method: sudo
+  vars:
+    php_version: "8.2"
+    nginx_remove_default_vhost: true
+    drupal_core_version: "10.1.6"
+    drupal_db_name: "drupaldb"
+    drupal_db_user: "drupaluser"
+    drupal_db_password: "DbPass123!"
+    drupal_admin_user: "admin"
+    drupal_admin_password: "SecurePass123!"
+    drupal_root: "/var/www/drupal"
+    drupal_web_root: "{{ drupal_root }}/web"
+    composer_timeout: 1800
+
+  handlers:
+    - name: restart php-fpm
+      service:
+        name: php{{ php_version }}-fpm
+        state: restarted
+        
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+        
+    - name: restart postgresql
+      service:
+        name: postgresql
+        state: restarted
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - python3-psycopg2
+          - git
+          - unzip
+          - ca-certificates
+          - software-properties-common
+          - gnupg
+          - postgresql-contrib  # Добавлено для расширений PostgreSQL
+        state: present
+
+    # Остановка и удаление Apache
+    - name: Ensure Apache is not installed
+      block:
+        - name: Check if Apache is installed
+          package_facts:
+            manager: auto
+          
+        - name: Stop and disable Apache
+          service:
+            name: apache2
+            state: stopped
+            enabled: no
+          when: "'apache2' in ansible_facts.packages"
+          
+        - name: Remove Apache
+          apt:
+            name: apache2
+            state: absent
+            purge: yes
+            autoremove: yes
+          when: "'apache2' in ansible_facts.packages"
+          
+    # Гарантированная очистка Drupal директории
+    - name: Ensure Drupal directory is empty
+      block:
+        - name: Remove Drupal directory
+          file:
+            path: "{{ drupal_root }}"
+            state: absent
+          
+        - name: Create Drupal directory
+          file:
+            path: "{{ drupal_root }}"
+            state: directory
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+            mode: "0755"
+
+  roles:
+    - role: geerlingguy.postgresql
+      vars:
+        postgresql_python_library: "psycopg2-binary"
+        postgresql_databases:
+          - name: "{{ drupal_db_name }}"
+            encoding: "UTF8"
+            lc_collate: "en_US.UTF-8"
+            lc_ctype: "en_US.UTF-8"
+        postgresql_users:
+          - name: "{{ drupal_db_user }}"
+            password: "{{ drupal_db_password }}"
+            encrypted: yes
+            role_attr_flags: "CREATEDB,CREATEROLE,LOGIN"
+      notify: restart postgresql
+        
+    - role: geerlingguy.php
+      vars:
+        php_enable_php_fpm: true
+        php_packages:
+          - "php{{ php_version }}-fpm"
+          - "php{{ php_version }}-common"
+          - "php{{ php_version }}-curl"
+          - "php{{ php_version }}-gd"
+          - "php{{ php_version }}-mbstring"
+          - "php{{ php_version }}-xml"
+          - "php{{ php_version }}-zip"
+          - "php{{ php_version }}-opcache"
+          - "php{{ php_version }}-apcu"
+          - "php{{ php_version }}-pgsql"
+        php_fpm_daemon: "php{{ php_version }}-fpm"
+        
+    - role: geerlingguy.composer
+      vars:
+        composer_global_packages: []
+        composer_install_dir: /usr/local/bin
+
+  tasks:
+    # Установка расширения pg_trgm
+    - name: Install pg_trgm extension
+      become: yes
+      become_user: postgres
+      community.postgresql.postgresql_ext:
+        name: pg_trgm
+        db: "{{ drupal_db_name }}"
+        state: present
+
+    # Дополнительные права для пользователя PostgreSQL
+    - name: Grant database privileges to user
+      become: yes
+      become_user: postgres
+      community.postgresql.postgresql_privs:
+        database: "{{ drupal_db_name }}"
+        roles: "{{ drupal_db_user }}"
+        type: database
+        privs: ALL
+        grant_option: yes
+        
+    - name: Grant schema privileges to user
+      become: yes
+      become_user: postgres
+      community.postgresql.postgresql_privs:
+        database: "{{ drupal_db_name }}"
+        roles: "{{ drupal_db_user }}"
+        type: schema
+        objs: public
+        privs: ALL
+        grant_option: yes
+        
+    - name: Grant table privileges to user
+      become: yes
+      become_user: postgres
+      community.postgresql.postgresql_privs:
+        database: "{{ drupal_db_name }}"
+        roles: "{{ drupal_db_user }}"
+        type: table
+        objs: ALL_IN_SCHEMA
+        schema: public
+        privs: ALL
+        grant_option: yes
+
+    # Установка NGINX
+    - name: Install NGINX
+      apt:
+        name: nginx
+        state: present
+        
+    - name: Remove default NGINX site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+        
+    - name: Create PHP-FPM pool configuration
+      copy:
+        dest: "/etc/php/{{ php_version }}/fpm/pool.d/www.conf"
+        content: |
+          [www]
+          user = www-data
+          group = www-data
+          listen = /run/php/php{{ php_version }}-fpm.sock
+          listen.owner = www-data
+          listen.group = www-data
+          pm = dynamic
+          pm.max_children = 10
+          pm.start_servers = 4
+          pm.min_spare_servers = 2
+          pm.max_spare_servers = 6
+      notify: restart php-fpm
+      
+    - name: Create Nginx configuration for Drupal
+      template:
+        src: "templates/drupal-site.conf.j2"
+        dest: /etc/nginx/sites-available/drupal
+        owner: root
+        group: root
+        mode: '0644'
+      
+    - name: Validate NGINX configuration
+      command: nginx -t
+      register: nginx_validation
+      changed_when: false
+      
+    - name: Debug NGINX validation
+      debug:
+        var: nginx_validation
+      
+    - name: Enable Drupal site in Nginx
+      file:
+        src: /etc/nginx/sites-available/drupal
+        dest: /etc/nginx/sites-enabled/drupal
+        state: link
+      when: nginx_validation.rc == 0
+      notify: restart nginx
+      
+    # Установка Drupal
+    - name: Download Drupal with Composer
+      command: >
+        composer create-project drupal/recommended-project:{{ drupal_core_version }} .
+        --no-interaction
+        --ignore-platform-reqs
+      args:
+        chdir: "{{ drupal_root }}"
+      environment:
+        COMPOSER_MEMORY_LIMIT: -1
+        COMPOSER_ALLOW_SUPERUSER: 1
+        
+    - name: Install Drush locally via Composer
+      command: "composer require drush/drush --no-interaction --ignore-platform-reqs"
+      args:
+        chdir: "{{ drupal_root }}"
+      environment:
+        COMPOSER_MEMORY_LIMIT: -1
+        COMPOSER_ALLOW_SUPERUSER: 1
+        
+    - name: Set correct permissions for Drupal
+      file:
+        path: "{{ drupal_root }}"
+        state: directory
+        recurse: yes
+        owner: "www-data"
+        group: "www-data"
+        mode: "0755"
+        
+    - name: Ensure files directory exists
+      file:
+        path: "{{ drupal_web_root }}/sites/default/files"
+        state: directory
+        owner: "www-data"
+        group: "www-data"
+        mode: "0775"
+        
+    # Создание settings.php
+    - name: Copy default.settings.php to settings.php
+      copy:
+        src: "{{ drupal_web_root }}/sites/default/default.settings.php"
+        dest: "{{ drupal_web_root }}/sites/default/settings.php"
+        owner: "www-data"
+        group: "www-data"
+        mode: "0644"
+        
+    - name: Set database configuration in settings.php
+      blockinfile:
+        path: "{{ drupal_web_root }}/sites/default/settings.php"
+        block: |
+          $databases['default']['default'] = array(
+            'database' => '{{ drupal_db_name }}',
+            'username' => '{{ drupal_db_user }}',
+            'password' => '{{ drupal_db_password }}',
+            'host' => 'localhost',
+            'port' => '',
+            'driver' => 'pgsql',
+            'prefix' => '',
+          );
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DATABASE CONFIG"
+        
+    - name: Install Drupal with Drush
+      command: >
+        ./vendor/bin/drush site-install standard -y
+        --root={{ drupal_web_root }}
+        --site-name="Drupal"
+        --account-name={{ drupal_admin_user }}
+        --account-pass={{ drupal_admin_password }}
+        --db-url=pgsql://{{ drupal_db_user }}:{{ drupal_db_password }}@127.0.0.1/{{ drupal_db_name }}
+      args:
+        chdir: "{{ drupal_root }}"
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: 1
+        
+    - name: Fix settings.php permissions
+      file:
+        path: "{{ drupal_web_root }}/sites/default/settings.php"
+        state: file
+        owner: "www-data"
+        group: "www-data"
+        mode: "0444"
+        
+    - name: Restart PHP-FPM service
+      service:
+        name: php{{ php_version }}-fpm
+        state: restarted
+      notify: restart php-fpm
+        
+    - name: Verify Drupal installation
+      uri:
+        url: "http://{{ ansible_host }}"
+        return_content: yes
+        status_code: 200
+      register: drupal_page
+      retries: 5
+      delay: 10
+      until: drupal_page.status == 200 and 'Drupal' in drupal_page.content
+      ignore_errors: yes
+      
+    - name: Show success message
+      debug:
+        msg: "Drupal successfully installed at http://{{ ansible_host }}"
+      when: drupal_page.status == 200 and 'Drupal' in drupal_page.content
+
+    # Расширенная диагностика при ошибке
+    - name: Comprehensive debug on failure
+      block:
+        - name: Check PostgreSQL extensions
+          become: yes
+          become_user: postgres
+          command: psql -d "{{ drupal_db_name }}" -c "\\dx"
+          register: pg_extensions
+          
+        - name: Show PostgreSQL extensions
+          debug:
+            var: pg_extensions.stdout
+            
+        - name: Check Drupal requirements
+          command: >
+            ./vendor/bin/drush core:requirements
+            --root={{ drupal_web_root }}
+          args:
+            chdir: "{{ drupal_root }}"
+          register: drupal_requirements
+          
+        - name: Show Drupal requirements
+          debug:
+            var: drupal_requirements.stdout
+      when: drupal_page.status != 200 or 'Drupal' not in drupal_page.content

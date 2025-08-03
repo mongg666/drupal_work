@@ -1,0 +1,8 @@
+---
+roles:
+  - geerlingguy.postgresql
+  - geerlingguy.php
+  - geerlingguy.php-pgsql
+  - geerlingguy.nginx
+  - geerlingguy.composer
+  - geerlingguy.drupal
